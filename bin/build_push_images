@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+. bin/lib/docker.sh
+
+docker.image.pull.all.project.images
+
+docker.ensure.alpine.image.builder.image.exists
