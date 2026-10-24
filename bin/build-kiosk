@@ -21,6 +21,7 @@ docker pull "${ALPINE_IMAGE_BUILDER_IMAGE}"
 echo "Building base Alpine image ${OUTPUT_PATH}/${IMG_NAME}.img..."
 docker run \
   --rm \
+  -it \
   --privileged \
   -e "DEFAULT_HOSTNAME=${DEFAULT_HOSTNAME}" \
   -v /dev:/dev \
