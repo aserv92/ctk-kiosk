@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source ./bin/lib/blk.sh
+source ./bin/lib/dir.sh
+source ./docker/lib/images.sh
+source ./libraries/bash/env.sh
+
+INPUT_PATH="./image/input"
+OUTPUT_PATH="./image/output"

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source ./docker/lib/images.sh
+
+rust.container() {
+  docker run \
+    --rm \
+    -it \
+    --platform linux/arm64 \
+    -e CARGO_TARGET_DIR=dist/cargo \
+    -u "$(id -u):$(id -g)" \
+    -w /workdir \
+    -v "$(pwd):/workdir" \
+    "${RUST_IMAGE}" \
+    "$@"
+}
+
+rust.cargo() {
+  rust.container \
+    cargo \
+    "$@"
+}
+
+rust.rustc() {
+  rust.container \
+    rustc \
+    "$@"
+}
