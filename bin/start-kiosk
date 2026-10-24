@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source ./libraries/bash/env.sh
+
+env.load build
+
+OUTPUT_PATH="./image/output"
+VM_NAME=ctk-kiosk
+disk_rebuilt=0
+
+image_path="$(pwd)/${OUTPUT_PATH}/${IMG_NAME}.img"
+disk_path="$(pwd)/${OUTPUT_PATH}/${IMG_NAME}.vdi"
+
+if [[ ! -f "$image_path" ]]; then
+  echo "Image does not exist: ${image_path}" >&2
+  echo "Run ./bin/build-kiosk first." >&2
+  exit 1
+fi
+
+if ! command -v VBoxManage >/dev/null; then
+  echo "VBoxManage was not found. Install VirtualBox, then rerun this script." >&2
+  exit 1
+fi
+
+ensure_vbox_module() {
+  if [[ -e /dev/vboxdrv ]]; then
+    return 0
+  fi
+
+  echo "The VirtualBox kernel module is not loaded. Building and loading it..."
+  sudo /sbin/vboxconfig || true
+
+  if [[ -e /dev/vboxdrv ]]; then
+    return 0
+  fi
+
+  echo "VirtualBox did not load a kernel module for $(uname -r)." >&2
+  if [[ -r /var/log/vbox-setup.log ]]; then
+    grep -E '^ERROR:|vboxdrv.sh: failed' /var/log/vbox-setup.log >&2 || true
+  fi
+  echo "Installed VirtualBox is $(dpkg-query -W -f='${Version}' virtualbox-7.2). Kernel $(uname -r) needs VirtualBox 7.2.22." >&2
+  echo "Upgrade, then rerun this script:" >&2
+  echo "  wget https://download.virtualbox.org/virtualbox/7.2.22/virtualbox-7.2_7.2.22-175245~Ubuntu~noble_amd64.deb" >&2
+  echo "  sudo apt install ./virtualbox-7.2_7.2.22-175245~Ubuntu~noble_amd64.deb" >&2
+  exit 1
+}
+
+ensure_vbox_group() {
+  if id -nG | grep -qw vboxusers; then
+    return 0
+  fi
+
+  if ! id -nG "$USER" | grep -qw vboxusers; then
+    echo "Adding ${USER} to the vboxusers group..."
+    sudo usermod -aG vboxusers "$USER"
+  fi
+
+  local script
+  script="$(command -v "$0" || true)"
+  script="$(readlink -f "${script:-$0}")"
+  echo "Restarting with the vboxusers group..."
+  exec sg vboxusers -c "$(printf '%q ' "$script" "$@")"
+}
+
+ensure_vbox_module
+ensure_vbox_group "$@"
+
+vm_state() {
+  VBoxManage showvminfo "$VM_NAME" --machinereadable \
+    | sed -n 's/^VMState="\(.*\)"$/\1/p'
+}
+
+attached_disk() {
+  VBoxManage showvminfo "$VM_NAME" --machinereadable \
+    | sed -n 's/^"SATA-0-0"="\(.*\)"$/\1/p'
+}
+
+vm_exists() {
+  VBoxManage list vms | grep -E "^\"${VM_NAME}\" " >/dev/null
+}
+
+vm_config_file() {
+  VBoxManage showvminfo "$1" --machinereadable 2>/dev/null \
+    | sed -n 's/^CfgFile="\(.*\)"$/\1/p'
+}
+
+forget_missing_vm() {
+  local line name uuid config
+  while IFS= read -r line; do
+    [[ "$line" =~ ^\"([^\"]+)\"\ \{([0-9a-fA-F-]+)\} ]] || continue
+    name="${BASH_REMATCH[1]}"
+    uuid="${BASH_REMATCH[2]}"
+    if [[ "$name" != "$VM_NAME" ]]; then
+      continue
+    fi
+    config="$(vm_config_file "$uuid")"
+    if [[ -z "$config" || ! -f "$config" ]]; then
+      echo "VirtualBox machine ${VM_NAME} is registered, but its files are missing. Removing it..."
+      VBoxManage unregistervm "$uuid"
+    fi
+  done < <(VBoxManage list vms 2>/dev/null)
+}
+
+ensure_vm() {
+  forget_missing_vm
+  if vm_exists; then
+    return 0
+  fi
+
+  echo "Creating VirtualBox machine ${VM_NAME}..."
+  VBoxManage createvm --name "$VM_NAME" --ostype Linux_64 --register
+  VBoxManage modifyvm "$VM_NAME" \
+    --memory 2048 \
+    --cpus 2 \
+    --firmware efi64 \
+    --nic1 nat \
+    --nic-type1 82540EM \
+    --audio-enabled off \
+    --boot1 disk \
+    --graphicscontroller vmsvga \
+    --vram 16 \
+    --ioapic on \
+    --rtc-use-utc on
+  VBoxManage storagectl "$VM_NAME" \
+    --name SATA \
+    --add sata \
+    --controller IntelAhci \
+    --portcount 1 \
+    --bootable on
+}
+
+ensure_disk() {
+  if [[ -f "$disk_path" && "$disk_path" -nt "$image_path" ]]; then
+    return 0
+  fi
+
+  if vm_exists; then
+    local state
+    state="$(vm_state)"
+    if [[ "$state" == "running" || "$state" == "paused" ]]; then
+      echo "The image is newer than the VirtualBox disk, and ${VM_NAME} is ${state}." >&2
+      echo "Power off the machine, then rerun this script." >&2
+      exit 1
+    fi
+    if [[ "$state" == "saved" ]]; then
+      VBoxManage discardstate "$VM_NAME"
+    fi
+    local attached
+    attached="$(attached_disk)"
+    if [[ -n "$attached" && "$attached" != "none" ]]; then
+      VBoxManage storageattach "$VM_NAME" \
+        --storagectl SATA \
+        --port 0 \
+        --device 0 \
+        --type hdd \
+        --medium none
+    fi
+  fi
+
+  if VBoxManage list hdds | grep -F "${IMG_NAME}.vdi" >/dev/null; then
+    VBoxManage closemedium disk "$disk_path" || VBoxManage closemedium disk "${IMG_NAME}.vdi"
+  fi
+  rm -f "$disk_path"
+
+  echo "Converting ${image_path} to a VirtualBox disk..."
+  VBoxManage convertfromraw "$image_path" "$disk_path" --format VDI
+  disk_rebuilt=1
+}
+
+attach_disk() {
+  local attached
+  attached="$(attached_disk)"
+  if [[ "$disk_rebuilt" != 1 && "$attached" == "$disk_path" ]]; then
+    return 0
+  fi
+
+  if [[ -n "$attached" && "$attached" != "none" ]]; then
+    VBoxManage storageattach "$VM_NAME" \
+      --storagectl SATA \
+      --port 0 \
+      --device 0 \
+      --type hdd \
+      --medium none
+  fi
+
+  VBoxManage storageattach "$VM_NAME" \
+    --storagectl SATA \
+    --port 0 \
+    --device 0 \
+    --type hdd \
+    --medium "$disk_path"
+}
+
+ensure_vm
+ensure_disk
+attach_disk
+
+if [[ "$(vm_state)" == "running" ]]; then
+  echo "${VM_NAME} is already running."
+  exit 0
+fi
+
+echo "Starting ${VM_NAME}..."
+VBoxManage startvm "$VM_NAME" --type gui
