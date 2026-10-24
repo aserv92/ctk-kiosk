@@ -9,59 +9,29 @@ source ./libraries/bash/env.sh
 
 env.load build
 
-INPUT_PATH="./image/input"
-OUTPUT_PATH="./image/output"
+IMAGE_PATH="./image"
+OUTPUT_PATH="${IMAGE_PATH}/output"
 IMAGE_SIZE=2G
 
 dir.clean "$OUTPUT_PATH"
-mkdir -p "$INPUT_PATH"
 
 echo "Pulling ${ALPINE_IMAGE_BUILDER_IMAGE}..."
 docker pull "${ALPINE_IMAGE_BUILDER_IMAGE}"
-
-configure_script="$(mktemp)"
-trap 'rm -f "$configure_script"' EXIT
-cat > "$configure_script" <<EOF
-#!/bin/sh
-set -eu
-printf '%s\n' '${DEFAULT_HOSTNAME}' > etc/hostname
-
-apk add --no-cache grub-efi
-
-boot_line=\$(cat boot/startup.nsh)
-kernel=\${boot_line%% *}
-rest=\${boot_line#* }
-initrd=\$(printf '%s\n' "\$rest" | sed -n 's/.*initrd=\\([^ ]*\\).*/\\1/p')
-cmdline=\$(printf '%s\n' "\$rest" | sed "s/initrd=\${initrd}//")
-
-mkdir -p boot/EFI/BOOT
-cat > /tmp/grub.cfg <<GRUB
-set timeout=0
-search --file --set=root /\${kernel}
-linux /\${kernel} \${cmdline}
-initrd /\${initrd}
-boot
-GRUB
-
-grub-mkimage -O x86_64-efi -o boot/EFI/BOOT/BOOTX64.EFI -p /EFI/BOOT \\
-  part_gpt fat search search_fs_file normal linux configfile \\
-  -c /tmp/grub.cfg
-EOF
-chmod +x "$configure_script"
 
 echo "Building base Alpine image ${OUTPUT_PATH}/${IMG_NAME}.img..."
 docker run \
   --rm \
   --privileged \
+  -e "DEFAULT_HOSTNAME=${DEFAULT_HOSTNAME}" \
   -v /dev:/dev \
   -v /lib/modules:/lib/modules:ro \
-  -v "${configure_script}:/configure.sh:ro" \
-  -v "$(pwd)/${OUTPUT_PATH}:/workdir" \
+  -v "${IMAGE_PATH}:/workdir/image" \
   "${ALPINE_IMAGE_BUILDER_IMAGE}" \
-  --branch "${ALPINE_BRANCH}" \
-  --boot-mode UEFI \
-  --kernel-flavor lts \
-  --image-format raw \
-  --image-size "${IMAGE_SIZE}" \
-  "/workdir/${IMG_NAME}.img" \
-  /configure.sh
+    --branch "${ALPINE_BRANCH}" \
+    --boot-mode UEFI \
+    --kernel-flavor lts \
+    --image-format raw \
+    --image-size "${IMAGE_SIZE}" \
+    --script-chroot \
+    "/workdir/image/output/${IMG_NAME}.img" \
+    /workdir/image/run-stages.sh
