@@ -5,9 +5,14 @@ set -euo pipefail
 source ./docker/lib/images.sh
 
 rust.container() {
+  local tty_args=(-i)
+  if [[ -t 1 ]]; then
+    tty_args+=(-t)
+  fi
+
   docker run \
     --rm \
-    -it \
+    "${tty_args[@]}" \
     --platform linux/amd64 \
     -e CARGO_HOME=/workdir/dist/cargo-home \
     -e CARGO_TARGET_DIR=dist/cargo \

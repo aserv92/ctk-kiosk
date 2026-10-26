@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# Build the kiosk image, build the USB installer, and write the installer to a USB drive.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+source ./libraries/bash/env.sh
+
+env.load build
+
+INSTALLER_IMAGE="./image/output/${IMG_NAME}-installer.img"
+
+usage() {
+  cat <<EOF
+Usage: ./bin/build-usb [--yes] [/dev/sdX]
+
+Build the kiosk image and the USB installer, then write the installer to a
+USB drive. The write erases that drive.
+
+With no device, the only plugged-in USB disk is used. Pass the device when
+more than one USB disk is plugged in. --yes skips the confirmation prompt
+and still requires the device.
+EOF
+}
+
+whole_disk() {
+  local dev="$1"
+  local parent
+
+  dev="$(readlink -f "$dev")"
+  while true; do
+    parent="$(lsblk -dn -o PKNAME "$dev" 2>/dev/null || true)"
+    parent="${parent%%[[:space:]]*}"
+    if [[ -z "$parent" ]]; then
+      printf '%s\n' "$dev"
+      return
+    fi
+    dev="/dev/${parent}"
+  done
+}
+
+disk_holding() {
+  local path="$1"
+  local source
+
+  source="$(findmnt -n -o SOURCE --target "$path" 2>/dev/null || true)"
+  if [[ -z "$source" ]]; then
+    echo "Cannot find the disk that holds ${path}." >&2
+    return 1
+  fi
+  whole_disk "$source"
+}
+
+usb_disks() {
+  local name transport kind
+
+  while read -r name transport kind; do
+    [[ "$kind" == "disk" && "$transport" == "usb" ]] || continue
+    printf '/dev/%s\n' "$name"
+  done < <(lsblk -dn -o NAME,TRAN,TYPE)
+}
+
+assert_usb_target() {
+  local dev="$1"
+  local transport kind root_disk image_disk
+
+  dev="$(readlink -f "$dev")"
+  if [[ ! -b "$dev" ]]; then
+    echo "${dev} is not a block device." >&2
+    return 1
+  fi
+
+  kind="$(lsblk -dn -o TYPE "$dev")"
+  if [[ "$kind" != "disk" ]]; then
+    echo "${dev} is a ${kind}. Pass the whole USB disk, for example /dev/sdb." >&2
+    return 1
+  fi
+
+  transport="$(lsblk -dn -o TRAN "$dev")"
+  transport="${transport%%[[:space:]]*}"
+  if [[ "$transport" != "usb" ]]; then
+    echo "${dev} is not a USB drive." >&2
+    return 1
+  fi
+
+  root_disk="$(disk_holding /)"
+  if [[ "$dev" == "$root_disk" ]]; then
+    echo "Refusing to erase ${dev}. That disk holds the running system." >&2
+    return 1
+  fi
+
+  if [[ -e "$INSTALLER_IMAGE" ]]; then
+    image_disk="$(disk_holding "$INSTALLER_IMAGE")"
+    if [[ "$dev" == "$image_disk" ]]; then
+      echo "Refusing to erase ${dev}. That disk holds the installer image." >&2
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$dev"
+}
+
+choose_usb() {
+  local requested="$1"
+  local disks=()
+  local disk
+
+  if [[ -n "$requested" ]]; then
+    assert_usb_target "$requested" || return 1
+    return 0
+  fi
+
+  while IFS= read -r disk; do
+    [[ -n "$disk" ]] || continue
+    disks+=("$disk")
+  done < <(usb_disks)
+
+  if [[ ${#disks[@]} -eq 0 ]]; then
+    echo "No USB drive is plugged in. Plug one in and pass it, for example ./bin/build-usb /dev/sdb." >&2
+    return 1
+  fi
+  if [[ ${#disks[@]} -gt 1 ]]; then
+    echo "More than one USB drive is plugged in. Pass the one to erase:" >&2
+    lsblk -dn -o NAME,SIZE,MODEL,TRAN "${disks[@]}" >&2
+    return 1
+  fi
+
+  assert_usb_target "${disks[0]}"
+}
+
+confirm_write() {
+  local dev="$1"
+  local answer
+
+  echo "This erases ${dev}:"
+  lsblk -dn -o NAME,SIZE,MODEL,TRAN "$dev"
+  echo "Installer image: ${INSTALLER_IMAGE}"
+
+  if [[ "$ASSUME_YES" -eq 1 ]]; then
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    echo "Pass --yes ${dev} to write without a prompt." >&2
+    return 1
+  fi
+
+  printf 'Type %s to continue: ' "$dev"
+  read -r answer
+  if [[ "$answer" != "$dev" ]]; then
+    echo "Not writing." >&2
+    return 1
+  fi
+}
+
+assert_image_fits() {
+  local dev="$1"
+  local image_bytes disk_bytes
+
+  image_bytes="$(stat -c %s "$INSTALLER_IMAGE")"
+  disk_bytes="$(lsblk -dnbo SIZE "$dev")"
+  if [[ "$image_bytes" -gt "$disk_bytes" ]]; then
+    echo "The installer image is ${image_bytes} bytes and ${dev} is ${disk_bytes} bytes." >&2
+    return 1
+  fi
+}
+
+write_image() {
+  local dev="$1"
+  local mounts=()
+
+  mapfile -t mounts < <(lsblk -ln -o MOUNTPOINT "$dev" | awk 'NF')
+  if [[ ${#mounts[@]} -gt 0 ]]; then
+    echo "Unmounting ${dev}..."
+    sudo umount "${mounts[@]}"
+  fi
+
+  echo "Writing ${INSTALLER_IMAGE} to ${dev}..."
+  sudo dd if="$INSTALLER_IMAGE" of="$dev" bs=4M conv=fsync status=progress
+  sync
+  echo "Wrote the installer to ${dev}. You can unplug it."
+  echo "On the Surface Pro 3, disable Secure Boot, boot the USB drive with Volume Down held, and run the installer."
+}
+
+ASSUME_YES=0
+REQUESTED_DEVICE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes)
+      ASSUME_YES=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      if [[ -n "$REQUESTED_DEVICE" ]]; then
+        echo "Pass one USB device." >&2
+        exit 1
+      fi
+      REQUESTED_DEVICE="$1"
+      ;;
+  esac
+  shift
+done
+
+if [[ "$ASSUME_YES" -eq 1 && -z "$REQUESTED_DEVICE" ]]; then
+  echo "--yes needs the USB device, for example ./bin/build-usb --yes /dev/sdb." >&2
+  exit 1
+fi
+
+TARGET="$(choose_usb "$REQUESTED_DEVICE")"
+confirm_write "$TARGET"
+
+./bin/build-kiosk
+./bin/build-installer
+
+if [[ ! -f "$INSTALLER_IMAGE" ]]; then
+  echo "Installer image was not created: ${INSTALLER_IMAGE}" >&2
+  exit 1
+fi
+
+TARGET="$(assert_usb_target "$TARGET")"
+assert_image_fits "$TARGET"
+write_image "$TARGET"

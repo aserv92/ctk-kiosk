@@ -3,7 +3,6 @@
 set -euo pipefail
 
 source ./bin/lib/blk.sh
-source ./bin/lib/dir.sh
 source ./docker/lib/images.sh
 source ./libraries/bash/env.sh
 
@@ -12,16 +11,30 @@ env.load build
 IMAGE_PATH="./image"
 OUTPUT_PATH="${IMAGE_PATH}/output"
 IMAGE_SIZE=2G
+LAUNCHER_BIN="dist/cargo/release/kiosk-launcher"
 
-dir.clean "$OUTPUT_PATH"
+echo "Building kiosk-launcher..."
+./bin/cargo build --release --locked --manifest-path src/kiosk-launcher/Cargo.toml
+if [[ ! -x "$LAUNCHER_BIN" ]]; then
+  echo "cargo did not produce ${LAUNCHER_BIN}" >&2
+  exit 1
+fi
+install -m 0755 "$LAUNCHER_BIN" image/kiosk/kiosk-launcher
+
+mkdir -p "$OUTPUT_PATH"
+rm -f "${OUTPUT_PATH}/${IMG_NAME}.img"
 
 echo "Pulling ${ALPINE_IMAGE_BUILDER_IMAGE}..."
 docker pull "${ALPINE_IMAGE_BUILDER_IMAGE}"
 
 echo "Building base Alpine image ${OUTPUT_PATH}/${IMG_NAME}.img..."
+tty_args=(-i)
+if [[ -t 1 ]]; then
+  tty_args+=(-t)
+fi
 docker run \
   --rm \
-  -it \
+  "${tty_args[@]}" \
   --privileged \
   -e "DEFAULT_HOSTNAME=${DEFAULT_HOSTNAME}" \
   -v /dev:/dev \

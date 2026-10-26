@@ -1,0 +1,15 @@
+#!/bin/sh
+# xinit client. Keeps the X server up and runs kiosk-launcher in front of it.
+# xinit stops the server when this script exits, so a launcher that returns
+# is started again instead of dropping the display.
+set -u
+
+if [ ! -x /opt/ctk/kiosk-launcher ]; then
+  echo "kiosk-launcher is missing." >&2
+  exit 1
+fi
+
+while true; do
+  /opt/ctk/kiosk-launcher || true
+  sleep 1
+done

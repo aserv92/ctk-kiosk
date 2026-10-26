@@ -2,5 +2,6 @@
 dist/
 image/input/
 image/installer/ctk-installer
+image/kiosk/kiosk-launcher
 image/output/
 tmp/
