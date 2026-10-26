@@ -1,0 +1,3 @@
+# Static musl, so the installer runs on the Alpine image.
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -8,7 +8,8 @@ rust.container() {
   docker run \
     --rm \
     -it \
-    --platform linux/arm64 \
+    --platform linux/amd64 \
+    -e CARGO_HOME=/workdir/dist/cargo-home \
     -e CARGO_TARGET_DIR=dist/cargo \
     -u "$(id -u):$(id -g)" \
     -w /workdir \

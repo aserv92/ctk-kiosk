@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source ./docker/lib/images.sh
+source ./libraries/bash/env.sh
+
+env.load build
+
+IMAGE_PATH="./image"
+OUTPUT_PATH="${IMAGE_PATH}/output"
+# Room for Alpine, X, and the compressed 2G kiosk image.
+INSTALLER_IMAGE_SIZE=2G
+KIOSK_IMAGE="${OUTPUT_PATH}/${IMG_NAME}.img"
+INSTALLER_IMAGE="${OUTPUT_PATH}/${IMG_NAME}-installer.img"
+INSTALLER_BIN="dist/cargo/release/ctk-installer"
+
+if [[ ! -f "$KIOSK_IMAGE" ]]; then
+  echo "Kiosk image does not exist: ${KIOSK_IMAGE}" >&2
+  echo "Run ./bin/build-kiosk first." >&2
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_PATH"
+rm -f "$INSTALLER_IMAGE"
+
+echo "Building ctk-installer..."
+./bin/cargo build --release --locked --manifest-path src/installer/Cargo.toml
+if [[ ! -x "$INSTALLER_BIN" ]]; then
+  echo "cargo did not produce ${INSTALLER_BIN}" >&2
+  exit 1
+fi
+install -m 0755 "$INSTALLER_BIN" image/installer/ctk-installer
+
+echo "Pulling ${ALPINE_IMAGE_BUILDER_IMAGE}..."
+docker pull "${ALPINE_IMAGE_BUILDER_IMAGE}"
+
+echo "Building installer image ${INSTALLER_IMAGE}..."
+# --initfs-features replaces the alpine-make-vm-image default, so keep
+# kms, scsi, and virtio and add usb. The Surface boots this image from a
+# USB stick and the installed system from the internal SATA disk.
+docker run \
+  --rm \
+  -it \
+  --privileged \
+  -e "IMG_NAME=${IMG_NAME}" \
+  -v /dev:/dev \
+  -v /lib/modules:/lib/modules:ro \
+  -v "${IMAGE_PATH}:/workdir/image" \
+  "${ALPINE_IMAGE_BUILDER_IMAGE}" \
+    --branch "${ALPINE_BRANCH}" \
+    --boot-mode UEFI \
+    --kernel-flavor lts \
+    --image-format raw \
+    --image-size "${INSTALLER_IMAGE_SIZE}" \
+    --initfs-features "kms scsi virtio usb" \
+    --script-chroot \
+    "/workdir/image/output/${IMG_NAME}-installer.img" \
+    /workdir/image/run-installer.sh
+
+cat <<EOF
+
+Installer image: ${INSTALLER_IMAGE}
+
+Write it to a USB drive. Replace /dev/sdX with the USB drive. This erases that drive:
+
+  sudo dd if=${INSTALLER_IMAGE} of=/dev/sdX bs=4M conv=fsync status=progress
+
+On the Surface Pro 3, disable Secure Boot. Plug in the USB drive and a Type Cover, mouse, or USB keyboard. Hold Volume Down, press Power, and release Volume Down when the Surface logo appears. The installer opens on the display. Choose the internal drive and press Install. That erases the drive, writes the kiosk image, and expands the root filesystem. Unplug the USB drive, then press Reboot.
+EOF

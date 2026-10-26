@@ -1,0 +1,13 @@
+#!/bin/sh
+# Console session for the USB installer. Replaces getty on tty1.
+exec </dev/tty1 >/dev/tty1 2>&1
+
+printf '\n'
+if /opt/ctk/install.sh; then
+  sync
+  exec reboot
+fi
+
+printf '\nInstaller stopped. This shell is still running from the USB drive.\n'
+printf 'Run /opt/ctk/install.sh to open the installer again.\n\n'
+exec /bin/sh

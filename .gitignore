@@ -1,5 +1,6 @@
 .idea/
 dist/
 image/input/
+image/installer/ctk-installer
 image/output/
 tmp/
