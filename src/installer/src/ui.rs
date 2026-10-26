@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use x11rb::connection::Connection;
+use x11rb::protocol::randr::{ConnectionExt as _, Rotation};
 use x11rb::protocol::xproto::{
     ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
-    ImageFormat, ImageOrder, InputFocus, Screen, Visualtype, WindowClass,
+    ImageFormat, ImageOrder, InputFocus, Rectangle, Screen, Visualtype, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -96,8 +97,8 @@ pub fn run() -> Result<i32, String> {
     let (conn, screen_num) =
         x11rb::connect(None).map_err(|err| format!("Cannot open the display: {err}"))?;
     let screen = &conn.setup().roots[screen_num];
-    let width = u32::from(screen.width_in_pixels);
-    let height = u32::from(screen.height_in_pixels);
+    let fallback_width = screen.width_in_pixels;
+    let fallback_height = screen.height_in_pixels;
     let depth = screen.root_depth;
     let root = screen.root;
     let visual_id = screen.root_visual;
@@ -129,6 +130,10 @@ pub fn run() -> Result<i32, String> {
         len: bytes_per_pixel,
     };
 
+    use_best_resolution(&conn, root);
+    hide_cursor(&conn, root);
+    let (width, height) = display_size(&conn, root, fallback_width, fallback_height);
+
     let window = conn.generate_id().map_err(|err| err.to_string())?;
     conn.create_window(
         depth,
@@ -159,7 +164,7 @@ pub fn run() -> Result<i32, String> {
         .map_err(|err| err.to_string())?
         .check()
         .map_err(|err| err.to_string())?;
-    try_set_cursor(&conn, window);
+    hide_cursor(&conn, window);
     conn.map_window(window)
         .map_err(|err| err.to_string())?
         .check()
@@ -777,28 +782,429 @@ impl Keys {
     }
 }
 
-fn try_set_cursor(conn: &RustConnection, window: u32) {
-    let Ok(font) = conn.generate_id() else {
+fn hide_cursor(conn: &RustConnection, window: u32) {
+    let Ok(pixmap) = conn.generate_id() else {
         return;
     };
-    let Ok(opened) = conn.open_font(font, b"cursor") else {
-        return;
-    };
-    if opened.check().is_err() {
-        return;
-    }
-    let Ok(cursor) = conn.generate_id() else {
-        return;
-    };
-    // Glyph 68 in the cursor font is the left pointer. Glyph 69 is its mask.
-    let Ok(created) =
-        conn.create_glyph_cursor(cursor, font, font, 68, 69, 0, 0, 0, 65535, 65535, 65535)
-    else {
+    let Ok(created) = conn.create_pixmap(1, pixmap, window, 1, 1) else {
         return;
     };
     if created.check().is_err() {
         return;
     }
+    let Ok(gc) = conn.generate_id() else {
+        return;
+    };
+    let Ok(created) = conn.create_gc(gc, pixmap, &CreateGCAux::new().foreground(0)) else {
+        return;
+    };
+    if created.check().is_err() {
+        return;
+    }
+    // A cleared mask shows none of the cursor, so the pointer is invisible.
+    let Ok(cleared) = conn.poly_fill_rectangle(
+        pixmap,
+        gc,
+        &[Rectangle {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }],
+    ) else {
+        return;
+    };
+    if cleared.check().is_err() {
+        return;
+    }
+    let _ = conn.free_gc(gc);
+    let Ok(cursor) = conn.generate_id() else {
+        return;
+    };
+    let Ok(created) = conn.create_cursor(cursor, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 0, 0) else {
+        return;
+    };
+    if created.check().is_err() {
+        return;
+    }
+    let _ = conn.free_pixmap(pixmap);
     let aux = ChangeWindowAttributesAux::new().cursor(cursor);
-    let _ = conn.change_window_attributes(window, &aux);
+    if let Ok(changed) = conn.change_window_attributes(window, &aux) {
+        let _ = changed.check();
+    }
+    let _ = conn.free_cursor(cursor);
+}
+
+fn display_size(conn: &RustConnection, root: u32, fallback_width: u16, fallback_height: u16) -> (u32, u32) {
+    conn.get_geometry(root)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|geometry| (u32::from(geometry.width), u32::from(geometry.height)))
+        .unwrap_or((u32::from(fallback_width), u32::from(fallback_height)))
+}
+
+#[derive(Clone, Copy)]
+struct ListedMode {
+    id: u32,
+    width: u16,
+    height: u16,
+    refresh: u32,
+}
+
+fn use_best_resolution(conn: &RustConnection, root: u32) {
+    let Some(version) = conn.randr_query_version(1, 6).ok().and_then(|cookie| cookie.reply().ok()) else {
+        return;
+    };
+    if version.major_version == 0 || (version.major_version == 1 && version.minor_version < 2) {
+        return;
+    }
+    let Some(resources) = conn
+        .randr_get_screen_resources_current(root)
+        .ok().and_then(|cookie| cookie.reply().ok())
+    else {
+        return;
+    };
+    let Some(range) = conn
+        .randr_get_screen_size_range(root)
+        .ok().and_then(|cookie| cookie.reply().ok())
+    else {
+        return;
+    };
+    let Some(geometry) = conn.get_geometry(root).ok().and_then(|cookie| cookie.reply().ok()) else {
+        return;
+    };
+
+    let modes: Vec<ListedMode> = resources.modes.iter().map(listed_mode).collect();
+    let mut used = Vec::new();
+    let mut placements = Vec::new();
+    for &output in &resources.outputs {
+        let Some(info) = conn
+            .randr_get_output_info(output, resources.config_timestamp)
+            .ok().and_then(|cookie| cookie.reply().ok())
+        else {
+            continue;
+        };
+        if info.connection != x11rb::protocol::randr::Connection::CONNECTED {
+            continue;
+        }
+        let Some(crtc) = active_crtc(&info, &used) else {
+            continue;
+        };
+        let Some(crtc_info) = conn
+            .randr_get_crtc_info(crtc, resources.config_timestamp)
+            .ok().and_then(|cookie| cookie.reply().ok())
+        else {
+            continue;
+        };
+        let rotation = if u16::from(crtc_info.rotation) == 0 {
+            Rotation::ROTATE0
+        } else {
+            crtc_info.rotation
+        };
+        let Some(mode) = best_mode(
+            &modes,
+            &info.modes,
+            rotation,
+            range.min_width,
+            range.min_height,
+            range.max_width,
+            range.max_height,
+        ) else {
+            continue;
+        };
+        let (width, height) = oriented(mode.width, mode.height, rotation);
+        used.push(crtc);
+        placements.push(Placement {
+            output,
+            crtc,
+            mode: mode.id,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            rotation,
+            mm_width: if info.mm_width == 0 {
+                millimeters(width)
+            } else {
+                info.mm_width
+            },
+            mm_height: if info.mm_height == 0 {
+                millimeters(height)
+            } else {
+                info.mm_height
+            },
+            was_mode: crtc_info.mode,
+            was_x: crtc_info.x,
+            was_y: crtc_info.y,
+            was_width: crtc_info.width,
+            was_height: crtc_info.height,
+        });
+    }
+    layout_placements(&mut placements, range.max_width, range.max_height);
+    if placements.is_empty() {
+        return;
+    }
+
+    let screen_w = placements
+        .iter()
+        .map(|place| i32::from(place.x) + i32::from(place.width))
+        .max()
+        .unwrap_or(0);
+    let screen_h = placements
+        .iter()
+        .map(|place| i32::from(place.y) + i32::from(place.height))
+        .max()
+        .unwrap_or(0);
+    if screen_w <= 0
+        || screen_h <= 0
+        || screen_w > i32::from(range.max_width)
+        || screen_h > i32::from(range.max_height)
+    {
+        return;
+    }
+    let screen_w = screen_w as u16;
+    let screen_h = screen_h as u16;
+    let same = screen_w == geometry.width
+        && screen_h == geometry.height
+        && placements.iter().all(|place| {
+            place.was_mode == place.mode
+                && place.was_x == place.x
+                && place.was_y == place.y
+                && place.was_width == place.width
+                && place.was_height == place.height
+        });
+    if same {
+        return;
+    }
+
+    let mm_w = placements
+        .iter()
+        .fold(0u32, |total, place| total.saturating_add(place.mm_width))
+        .max(1);
+    let mm_h = placements
+        .iter()
+        .map(|place| place.mm_height)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    // The framebuffer has to cover the new mode before it is programmed, then shrink afterward.
+    let span_w = screen_w.max(geometry.width);
+    let span_h = screen_h.max(geometry.height);
+    let grew = span_w != geometry.width || span_h != geometry.height;
+    if grew && !set_screen_size(conn, root, span_w, span_h, mm_w, mm_h) {
+        return;
+    }
+
+    let mut failed = false;
+    for place in &placements {
+        let Some(reply) = conn
+            .randr_set_crtc_config(
+                place.crtc,
+                x11rb::CURRENT_TIME,
+                resources.config_timestamp,
+                place.x,
+                place.y,
+                place.mode,
+                place.rotation,
+                &[place.output],
+            )
+            .ok().and_then(|cookie| cookie.reply().ok())
+        else {
+            failed = true;
+            break;
+        };
+        if u8::from(reply.status) != u8::from(x11rb::protocol::randr::SetConfig::SUCCESS) {
+            failed = true;
+            break;
+        }
+    }
+    if failed {
+        if grew {
+            let _ = set_screen_size(
+                conn,
+                root,
+                geometry.width,
+                geometry.height,
+                millimeters(geometry.width),
+                millimeters(geometry.height),
+            );
+        }
+        return;
+    }
+    if screen_w != span_w || screen_h != span_h {
+        let _ = set_screen_size(conn, root, screen_w, screen_h, mm_w, mm_h);
+    }
+}
+
+struct Placement {
+    output: u32,
+    crtc: u32,
+    mode: u32,
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    rotation: Rotation,
+    mm_width: u32,
+    mm_height: u32,
+    was_mode: u32,
+    was_x: i16,
+    was_y: i16,
+    was_width: u16,
+    was_height: u16,
+}
+
+fn active_crtc(info: &x11rb::protocol::randr::GetOutputInfoReply, used: &[u32]) -> Option<u32> {
+    let mut candidates = Vec::new();
+    if info.crtc != 0 {
+        candidates.push(info.crtc);
+    }
+    candidates.extend(info.crtcs.iter().copied().filter(|crtc| *crtc != 0));
+    candidates.into_iter().find(|crtc| !used.contains(crtc))
+}
+
+fn listed_mode(mode: &x11rb::protocol::randr::ModeInfo) -> ListedMode {
+    ListedMode {
+        id: mode.id,
+        width: mode.width,
+        height: mode.height,
+        refresh: refresh_rank(mode.dot_clock, mode.htotal, mode.vtotal),
+    }
+}
+
+fn best_mode(
+    modes: &[ListedMode],
+    ids: &[u32],
+    rotation: Rotation,
+    min_width: u16,
+    min_height: u16,
+    max_width: u16,
+    max_height: u16,
+) -> Option<ListedMode> {
+    ids.iter()
+        .filter_map(|id| modes.iter().copied().find(|mode| mode.id == *id))
+        .filter(|mode| {
+            let (width, height) = oriented(mode.width, mode.height, rotation);
+            mode.width > 0
+                && mode.height > 0
+                && width >= min_width
+                && height >= min_height
+                && width <= max_width
+                && height <= max_height
+        })
+        .max_by_key(|mode| {
+            (
+                u32::from(mode.width) * u32::from(mode.height),
+                mode.refresh,
+                u32::from(mode.width),
+            )
+        })
+}
+
+fn oriented(width: u16, height: u16, rotation: Rotation) -> (u16, u16) {
+    let bits = u16::from(rotation);
+    let turned = bits & u16::from(Rotation::ROTATE90) != 0 || bits & u16::from(Rotation::ROTATE270) != 0;
+    if turned {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
+fn refresh_rank(dot_clock: u32, htotal: u16, vtotal: u16) -> u32 {
+    let total = u64::from(htotal) * u64::from(vtotal);
+    if total == 0 {
+        0
+    } else {
+        (u64::from(dot_clock) * 1000 / total) as u32
+    }
+}
+
+fn millimeters(pixels: u16) -> u32 {
+    (u32::from(pixels) * 254 / 960).max(1)
+}
+
+fn layout_placements(places: &mut Vec<Placement>, max_width: u16, max_height: u16) {
+    let mut kept = Vec::new();
+    let mut x = 0i32;
+    for mut place in places.drain(..) {
+        let next = x + i32::from(place.width);
+        if next > i32::from(max_width) || i32::from(place.height) > i32::from(max_height) {
+            if kept.is_empty() {
+                continue;
+            }
+            break;
+        }
+        place.x = x as i16;
+        place.y = 0;
+        x = next;
+        kept.push(place);
+    }
+    *places = kept;
+}
+
+fn set_screen_size(conn: &RustConnection, root: u32, width: u16, height: u16, mm_width: u32, mm_height: u32) -> bool {
+    conn.randr_set_screen_size(root, width, height, mm_width, mm_height)
+        .ok()
+        .and_then(|cookie| cookie.check().ok())
+        .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn modes() -> [ListedMode; 4] {
+        [
+            ListedMode {
+                id: 1,
+                width: 1280,
+                height: 800,
+                refresh: 60_000,
+            },
+            ListedMode {
+                id: 2,
+                width: 1920,
+                height: 1080,
+                refresh: 30_000,
+            },
+            ListedMode {
+                id: 3,
+                width: 1920,
+                height: 1080,
+                refresh: 60_000,
+            },
+            ListedMode {
+                id: 4,
+                width: 8000,
+                height: 8000,
+                refresh: 60_000,
+            },
+        ]
+    }
+
+    #[test]
+    fn best_mode_picks_the_largest_area_then_refresh() {
+        let best = best_mode(&modes(), &[1, 2, 3, 4], Rotation::ROTATE0, 1, 1, 4096, 4096).unwrap();
+        assert_eq!(best.id, 3);
+        assert!(best_mode(&modes(), &[], Rotation::ROTATE0, 1, 1, 100, 100).is_none());
+    }
+
+    #[test]
+    fn best_mode_uses_the_rotated_size() {
+        let modes = [ListedMode {
+            id: 1,
+            width: 2000,
+            height: 1000,
+            refresh: 1,
+        }];
+        assert!(best_mode(&modes, &[1], Rotation::ROTATE90, 1, 1, 1500, 2500).is_some());
+        assert!(best_mode(&modes, &[1], Rotation::ROTATE90, 1, 1, 2500, 1500).is_none());
+    }
+
+    #[test]
+    fn refresh_rank_uses_the_dot_clock() {
+        assert_eq!(refresh_rank(148_500_000, 2200, 1125), 60_000);
+        assert_eq!(refresh_rank(1, 0, 1), 0);
+    }
 }

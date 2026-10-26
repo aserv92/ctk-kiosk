@@ -10,7 +10,8 @@ path = "main.rs"
 
 [dependencies]
 font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
-x11rb = "0.13.1"
+png = "0.17"
+x11rb = { version = "0.13.1", features = ["randr"] }
 
 [profile.release]
 strip = true
