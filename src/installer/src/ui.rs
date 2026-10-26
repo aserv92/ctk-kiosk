@@ -1,19 +1,21 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::{ConnectionExt as _, Rotation};
 use x11rb::protocol::xproto::{
     ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
-    ImageFormat, ImageOrder, InputFocus, Rectangle, Screen, Visualtype, WindowClass,
+    GrabMode, ImageFormat, ImageOrder, InputFocus, ModMask, Rectangle, Screen, Visualtype,
+    WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
 use crate::disks::{self, Disk};
 use crate::install::{self, Progress};
+use crate::screensaver;
 
 const XK_RETURN: u32 = 0xff0d;
 const XK_KP_ENTER: u32 = 0xff8d;
@@ -152,6 +154,7 @@ pub fn run() -> Result<i32, String> {
                 EventMask::EXPOSURE
                     | EventMask::BUTTON_PRESS
                     | EventMask::KEY_PRESS
+                    | EventMask::POINTER_MOTION
                     | EventMask::STRUCTURE_NOTIFY,
             ),
     )
@@ -173,6 +176,7 @@ pub fn run() -> Result<i32, String> {
     conn.flush().map_err(|err| err.to_string())?;
 
     let keys = keyboard_map(&conn)?;
+    grab_windows_button(&conn, root, &keys);
     let mut frame = Frame::new(width, height, bytes_per_pixel, scanline_pad);
     let max_request = conn.setup().maximum_request_length as usize * 4;
     let app = Arc::new(Mutex::new(App {
@@ -184,10 +188,48 @@ pub fn run() -> Result<i32, String> {
         progress: Arc::new(Progress::new()),
     }));
     app.lock().expect("app lock").progress.touch();
+    let mut saver = screensaver::Saver::new();
+    let mut saver_on = false;
+    let mut manual = false;
+    let mut last_windows = Instant::now() - Duration::from_secs(1);
+    let mut last_input = Instant::now();
+    let mut saver_from = Instant::now();
+    let mut ignore_input_until = Instant::now();
     let mut seen = u64::MAX;
 
     loop {
         while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
+            if let Event::KeyPress(press) = &event {
+                if screensaver::windows_button(keys.keysym(press.detail)) {
+                    if last_windows.elapsed() >= Duration::from_millis(80) {
+                        last_windows = Instant::now();
+                        if saver_on {
+                            saver_on = false;
+                            manual = false;
+                            last_input = Instant::now();
+                            ignore_input_until = Instant::now() + Duration::from_millis(400);
+                            app.lock().expect("app lock").progress.touch();
+                        } else {
+                            saver_on = true;
+                            manual = true;
+                            saver_from = Instant::now();
+                        }
+                    }
+                    continue;
+                }
+            }
+            if input_event(&event) {
+                last_input = Instant::now();
+                if saver_on || Instant::now() < ignore_input_until {
+                    if saver_on {
+                        saver_on = false;
+                        manual = false;
+                        ignore_input_until = Instant::now() + Duration::from_millis(400);
+                        app.lock().expect("app lock").progress.touch();
+                    }
+                    continue;
+                }
+            }
             handle_event(&conn, window, width, height, &keys, &app, event)?;
         }
 
@@ -196,16 +238,55 @@ pub fn run() -> Result<i32, String> {
             return Ok(code);
         }
 
-        let generation = app.lock().expect("app lock").progress.generation();
-        if generation != seen {
-            let view = snapshot(&app.lock().expect("app lock"));
-            let hits = layout(width, height, &view);
-            paint(&mut frame, &view, &hits, &color_of);
-            present(&conn, window, gc, depth, &frame, max_request)?;
-            seen = generation;
+        let choosing = app.lock().expect("app lock").phase == Phase::Choose;
+        if !choosing {
+            manual = false;
         }
-        thread::sleep(Duration::from_millis(30));
+        if choosing && (manual || screensaver::idle_ready(last_input.elapsed(), true)) {
+            if manual {
+                saver_on = true;
+            } else if !saver_on {
+                saver_on = true;
+                saver_from = Instant::now();
+            }
+            let seconds = saver_from.elapsed().as_secs_f32();
+            saver.render(width, height, seconds);
+            frame.copy_rgb(saver.pixels(), saver.width(), saver.height(), &color_of);
+            present(&conn, window, gc, depth, &frame, max_request)?;
+        } else {
+            saver_on = false;
+            let generation = app.lock().expect("app lock").progress.generation();
+            if generation != seen {
+                let view = snapshot(&app.lock().expect("app lock"));
+                let hits = layout(width, height, &view);
+                paint(&mut frame, &view, &hits, &color_of);
+                present(&conn, window, gc, depth, &frame, max_request)?;
+                seen = generation;
+            }
+        }
+        thread::sleep(Duration::from_millis(if saver_on { 16 } else { 30 }));
     }
+}
+
+fn grab_windows_button(conn: &RustConnection, root: u32, keys: &Keys) {
+    for keycode in keys.keycodes_for(&screensaver::windows_keysyms()) {
+        let _ = conn.grab_key(
+            true,
+            root,
+            ModMask::ANY,
+            keycode,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        );
+    }
+    let _ = conn.flush();
+}
+
+fn input_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::ButtonPress(_) | Event::KeyPress(_) | Event::MotionNotify(_)
+    )
 }
 
 fn handle_event(
@@ -693,6 +774,39 @@ impl Frame {
         }
     }
 
+    fn copy_rgb(
+        &mut self,
+        rgb: &[u8],
+        src_w: u32,
+        src_h: u32,
+        color: &impl Fn(u8, u8, u8) -> Color,
+    ) {
+        if src_w == 0 || src_h == 0 || self.width == 0 || self.height == 0 {
+            return;
+        }
+        for y in 0..self.height {
+            let sy = (u64::from(y) * u64::from(src_h) / u64::from(self.height)) as u32;
+            let row = sy.min(src_h - 1) as usize * src_w as usize * 3;
+            for x in 0..self.width {
+                let sx = (u64::from(x) * u64::from(src_w) / u64::from(self.width)) as u32;
+                let index = row + sx.min(src_w - 1) as usize * 3;
+                let Some(pixel) = rgb.get(index..index + 3) else {
+                    return;
+                };
+                self.set_pixel(x as i32, y as i32, color(pixel[0], pixel[1], pixel[2]));
+            }
+        }
+    }
+
+    fn set_pixel(&mut self, x: i32, y: i32, color: Color) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        let index = y as usize * self.stride + x as usize * self.bytes_per_pixel;
+        let len = color.len.min(self.bytes_per_pixel);
+        self.data[index..index + len].copy_from_slice(&color.bytes[..len]);
+    }
+
     fn fill(&mut self, color: Color) {
         self.rect(
             Rect {
@@ -776,6 +890,20 @@ fn keyboard_map(conn: &RustConnection) -> Result<Keys, String> {
 }
 
 impl Keys {
+    fn keycodes_for(&self, symbols: &[u32]) -> Vec<u8> {
+        let per = usize::from(self.per.max(1));
+        let mut codes = Vec::new();
+        for (offset, row) in self.syms.chunks(per).enumerate() {
+            if row.iter().any(|sym| *sym != 0 && symbols.contains(sym)) {
+                let code = u16::from(self.min) + offset as u16;
+                if code <= u16::from(u8::MAX) {
+                    codes.push(code as u8);
+                }
+            }
+        }
+        codes
+    }
+
     fn keysym(&self, keycode: u8) -> u32 {
         let index = keycode.wrapping_sub(self.min) as usize * self.per as usize;
         self.syms.get(index).copied().unwrap_or(0)

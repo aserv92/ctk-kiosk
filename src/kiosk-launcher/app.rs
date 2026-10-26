@@ -8,6 +8,12 @@ pub enum Screen {
     Configure { scanning: bool, scan: String },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerAction {
+    PowerOff,
+    Restart,
+}
+
 pub struct App {
     pub config: Option<Config>,
     pub screen: Screen,
@@ -16,6 +22,8 @@ pub struct App {
     launch: Option<String>,
     hold: bool,
     clock: bool,
+    power_menu: bool,
+    power_action: Option<PowerAction>,
     generation: u64,
 }
 
@@ -40,6 +48,8 @@ impl App {
             launch: None,
             hold: false,
             clock,
+            power_menu: false,
+            power_action: None,
             generation: 1,
         }
     }
@@ -52,6 +62,36 @@ impl App {
 
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn power_menu(&self) -> bool {
+        self.power_menu
+    }
+
+    pub fn toggle_power_menu(&mut self) {
+        self.power_menu = !self.power_menu;
+        self.touch();
+    }
+
+    pub fn close_power_menu(&mut self) {
+        if self.power_menu {
+            self.power_menu = false;
+            self.touch();
+        }
+    }
+
+    pub fn power_off(&mut self) {
+        self.power_action = Some(PowerAction::PowerOff);
+        self.close_power_menu();
+    }
+
+    pub fn restart(&mut self) {
+        self.power_action = Some(PowerAction::Restart);
+        self.close_power_menu();
+    }
+
+    pub fn take_power_action(&mut self) -> Option<PowerAction> {
+        self.power_action.take()
     }
 
     pub fn set_wifi(&mut self, text: String) {
@@ -254,6 +294,16 @@ mod tests {
         app.tick();
         assert!(app.take_launch().is_none());
         assert!(matches!(app.screen, Screen::Configure { scanning: false, .. }));
+    }
+
+    #[test]
+    fn power_menu_returns_the_selected_action() {
+        let mut app = App::start(None, String::new());
+        app.toggle_power_menu();
+        assert!(app.power_menu());
+        app.restart();
+        assert!(!app.power_menu());
+        assert_eq!(app.take_power_action(), Some(PowerAction::Restart));
     }
 
     #[test]

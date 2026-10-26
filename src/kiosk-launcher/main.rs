@@ -1,5 +1,7 @@
 mod app;
 mod config;
+mod screensaver;
+mod sound;
 mod ui;
 mod wifi;
 

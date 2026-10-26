@@ -8,6 +8,7 @@ if [ ! -x /mnt/kiosk/kiosk-launcher ]; then
 fi
 
 apk add --no-cache \
+  alsa-utils \
   chromium \
   eudev \
   font-cursor-misc \

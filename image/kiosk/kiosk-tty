@@ -5,6 +5,7 @@ exec </dev/tty1 >/dev/tty1 2>&1
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 modprobe i915 2>/dev/null || true
+modprobe snd-hda-intel 2>/dev/null || true
 modprobe hid-multitouch 2>/dev/null || true
 modprobe atmel_mxt_ts 2>/dev/null || true
 

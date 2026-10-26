@@ -1,5 +1,5 @@
 use std::io::Cursor;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -7,14 +7,17 @@ use font8x8::{UnicodeFonts, BASIC_FONTS};
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::{ConnectionExt as _, Rotation};
 use x11rb::protocol::xproto::{
-    ChangeWindowAttributesAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
-    ImageFormat, ImageOrder, InputFocus, Rectangle, Screen, Visualtype, WindowClass,
+    ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux,
+    EventMask, GrabMode, ImageFormat, ImageOrder, InputFocus, ModMask, Rectangle, Screen, StackMode,
+    Visualtype, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
-use crate::app::{App, Screen as KioskScreen};
+use crate::app::{App, PowerAction, Screen as KioskScreen};
 use crate::config::Config;
+use crate::screensaver;
+use crate::sound;
 use crate::wifi;
 
 const XK_BACKSPACE: u32 = 0xff08;
@@ -22,6 +25,11 @@ const XK_RETURN: u32 = 0xff0d;
 const XK_ESCAPE: u32 = 0xff1b;
 const XK_KP_ENTER: u32 = 0xff8d;
 const XK_SHIFT: u16 = 0x1;
+const XK_XF86_POWER_DOWN: u32 = 0x1008_ff21;
+const XK_XF86_POWER_OFF: u32 = 0x1008_ff2a;
+// The Surface Pro 3 renders this scene entirely in software. A steady 30 FPS
+// is smooth for its slow-moving animation and leaves CPU time for Chrome.
+const SAVER_FRAME_TIME: Duration = Duration::from_millis(33);
 
 pub fn run() -> Result<i32, String> {
     let (config, notice) = match Config::load() {
@@ -93,6 +101,7 @@ pub fn run() -> Result<i32, String> {
                 EventMask::EXPOSURE
                     | EventMask::BUTTON_PRESS
                     | EventMask::KEY_PRESS
+                    | EventMask::POINTER_MOTION
                     | EventMask::STRUCTURE_NOTIFY,
             ),
     )
@@ -112,19 +121,79 @@ pub fn run() -> Result<i32, String> {
         .map_err(|err| err.to_string())?;
     let _ = conn.set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME);
     conn.flush().map_err(|err| err.to_string())?;
+    // The timeout stays on the X server, including after Chrome is in front.
+    arm_screen_off(&conn);
+    sound::play(&[sound::startup_cue(app.config.is_some())]);
 
     let keys = keyboard_map(&conn)?;
+    grab_special_buttons(&conn, root, &keys);
     let logo = decode_logo(include_bytes!("ctk-logo.png")).unwrap_or_default();
     let mut frame = Frame::new(width, height, bytes_per_pixel, scanline_pad);
     let mut background =
         render_background(width, height, bytes_per_pixel, scanline_pad, &logo, &color_of);
     let max_request = conn.setup().maximum_request_length as usize * 4;
+    let mut saver = screensaver::Saver::new();
+    let mut saver_on = false;
+    let mut manual = false;
+    let mut last_windows = Instant::now() - Duration::from_secs(1);
+    let mut window_shown = true;
+    let mut last_input = Instant::now();
+    let mut saver_from = Instant::now();
+    let mut ignore_input_until = Instant::now();
+    let mut awake_until = Instant::now();
+    let mut server_idle_known: Option<bool> = None;
+    let mut cached_server_idle = None;
+    let mut next_server_idle = Instant::now();
     let mut seen = 0u64;
     let mut next_tick = Instant::now() + Duration::from_secs(1);
     let mut next_wifi = Instant::now();
+    let mut chrome: Option<Child> = None;
 
     loop {
+        let loop_started = Instant::now();
         while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
+            if let Event::KeyPress(press) = &event {
+                let keysym = keys.keysym(press.detail, press.state.into());
+                if power_button(keysym) {
+                    last_input = Instant::now();
+                    if saver_on {
+                        saver_on = false;
+                        manual = false;
+                    }
+                    app.toggle_power_menu();
+                    continue;
+                }
+                if screensaver::windows_button(keysym) {
+                    if last_windows.elapsed() >= Duration::from_millis(80) {
+                        last_windows = Instant::now();
+                        if saver_on {
+                            saver_on = false;
+                            manual = false;
+                            ignore_input_until = Instant::now() + Duration::from_millis(400);
+                            awake_until = Instant::now() + Duration::from_millis(500);
+                            seen = 0;
+                        } else {
+                            saver_on = true;
+                            manual = true;
+                            saver_from = Instant::now();
+                        }
+                    }
+                    continue;
+                }
+            }
+            if input_event(&event) {
+                last_input = Instant::now();
+                if saver_on || Instant::now() < ignore_input_until {
+                    if saver_on {
+                        saver_on = false;
+                        manual = false;
+                        ignore_input_until = Instant::now() + Duration::from_millis(400);
+                        awake_until = Instant::now() + Duration::from_millis(500);
+                        seen = 0;
+                    }
+                    continue;
+                }
+            }
             match event {
                 Event::ConfigureNotify(configure) => {
                     let next_width = u32::from(configure.width);
@@ -175,18 +244,176 @@ pub fn run() -> Result<i32, String> {
         }
 
         if let Some(url) = app.take_launch() {
-            if let Err(err) = launch_chrome(&url) {
-                app.launch_failed(err);
+            match launch_chrome(&url) {
+                Ok(child) => chrome = Some(child),
+                Err(err) => app.launch_failed(err),
+            }
+        }
+        if let Some(action) = app.take_power_action() {
+            if let Err(err) = run_power_action(action) {
+                app.note(err);
+            }
+        }
+        if let Some(child) = chrome.as_mut() {
+            // Chrome leaving ends this process so the session starts the launcher again.
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return Ok(0),
+                Ok(None) => {}
             }
         }
 
-        if app.generation() != seen {
+        // This query waits for an X-server reply. Refreshing it once per second
+        // is sufficient for a minute-long idle timeout and avoids a round trip
+        // on every animation frame.
+        if now >= next_server_idle {
+            cached_server_idle = server_idle(&conn, root, &mut server_idle_known);
+            next_server_idle = now + Duration::from_secs(1);
+        }
+        let server_idle = cached_server_idle;
+        let chrome_running = chrome.is_some();
+        let idle = if chrome_running {
+            server_idle.unwrap_or(Duration::ZERO)
+        } else {
+            server_idle.unwrap_or_else(|| last_input.elapsed())
+        };
+        let can_save = !chrome_running || server_idle.is_some();
+        if app.power_menu() {
+            // Keep the menu visible when it was opened from the screen saver.
+            saver_on = false;
+            manual = false;
+        } else if manual {
+            saver_on = true;
+        } else if now >= awake_until && screensaver::idle_ready(idle, can_save) {
+            if !saver_on {
+                saver_on = true;
+                saver_from = Instant::now();
+            }
+        } else if now >= awake_until {
+            saver_on = false;
+        }
+
+        let want_window = !chrome_running || saver_on || app.power_menu();
+        if want_window != window_shown {
+            set_window_shown(&conn, window, want_window)?;
+            window_shown = want_window;
+            if want_window {
+                seen = 0;
+            }
+        }
+
+        if saver_on && window_shown {
+            let seconds = saver_from.elapsed().as_secs_f32();
+            saver.render(width, height, seconds);
+            frame.copy_rgb(saver.pixels(), saver.width(), saver.height(), &color_of);
+            present(&conn, window, gc, depth, &frame, max_request)?;
+        } else if (!chrome_running || app.power_menu()) && app.generation() != seen {
             paint(&mut frame, &background, &app, &color_of);
             present(&conn, window, gc, depth, &frame, max_request)?;
             seen = app.generation();
         }
-        thread::sleep(Duration::from_millis(30));
+        let delay = if saver_on {
+            SAVER_FRAME_TIME.saturating_sub(loop_started.elapsed())
+        } else {
+            Duration::from_millis(30)
+        };
+        thread::sleep(delay);
     }
+}
+
+fn grab_special_buttons(conn: &RustConnection, root: u32, keys: &Keys) {
+    let mut symbols = screensaver::windows_keysyms().to_vec();
+    symbols.extend([XK_XF86_POWER_DOWN, XK_XF86_POWER_OFF]);
+    for keycode in keys.keycodes_for(&symbols) {
+        let _ = conn.grab_key(
+            true,
+            root,
+            ModMask::ANY,
+            keycode,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        );
+    }
+    let _ = conn.flush();
+}
+
+fn power_button(keysym: u32) -> bool {
+    matches!(keysym, XK_XF86_POWER_DOWN | XK_XF86_POWER_OFF)
+}
+
+fn input_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::ButtonPress(_) | Event::KeyPress(_) | Event::MotionNotify(_)
+    )
+}
+
+fn arm_screen_off(conn: &RustConnection) {
+    use x11rb::protocol::dpms::ConnectionExt as _;
+    let Ok(cookie) = conn.dpms_capable() else {
+        return;
+    };
+    let Ok(reply) = cookie.reply() else {
+        return;
+    };
+    if !reply.capable {
+        return;
+    }
+    let seconds = screensaver::screen_off_seconds();
+    if let Ok(cookie) = conn.dpms_set_timeouts(0, 0, seconds) {
+        let _ = cookie.check();
+    }
+    if let Ok(cookie) = conn.dpms_enable() {
+        let _ = cookie.check();
+    }
+    if let Ok(cookie) = conn.dpms_force_level(x11rb::protocol::dpms::DPMSMode::ON) {
+        let _ = cookie.check();
+    }
+}
+
+fn server_idle(
+    conn: &RustConnection,
+    root: u32,
+    known: &mut Option<bool>,
+) -> Option<Duration> {
+    if *known == Some(false) {
+        return None;
+    }
+    use x11rb::protocol::screensaver::ConnectionExt as _;
+    let reply = conn
+        .screensaver_query_info(root)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok());
+    let Some(reply) = reply else {
+        *known = Some(false);
+        return None;
+    };
+    *known = Some(true);
+    Some(Duration::from_millis(u64::from(reply.ms_since_user_input)))
+}
+
+fn set_window_shown(conn: &RustConnection, window: u32, shown: bool) -> Result<(), String> {
+    if shown {
+        conn.map_window(window)
+            .map_err(|err| err.to_string())?
+            .check()
+            .map_err(|err| err.to_string())?;
+        conn.configure_window(
+            window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )
+        .map_err(|err| err.to_string())?
+        .check()
+        .map_err(|err| err.to_string())?;
+        let _ = conn.set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME);
+    } else {
+        conn.unmap_window(window)
+            .map_err(|err| err.to_string())?
+            .check()
+            .map_err(|err| err.to_string())?;
+        let _ = conn.set_input_focus(InputFocus::POINTER_ROOT, x11rb::NONE, x11rb::CURRENT_TIME);
+    }
+    conn.flush().map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 fn store_config(app: &mut App, config: Config) {
@@ -203,6 +430,16 @@ fn store_config(app: &mut App, config: Config) {
 
 fn on_click(app: &mut App, width: u32, height: u32, x: i32, y: i32) {
     let hits = layout(width, height);
+    if app.power_menu() {
+        if hits.power_off.contains(x, y) {
+            app.power_off();
+        } else if hits.restart.contains(x, y) {
+            app.restart();
+        } else {
+            app.close_power_menu();
+        }
+        return;
+    }
     if hits.action.contains(x, y) {
         app.press_action();
     }
@@ -211,13 +448,24 @@ fn on_click(app: &mut App, width: u32, height: u32, x: i32, y: i32) {
 fn on_key(app: &mut App, keysym: u32) {
     match keysym {
         XK_RETURN | XK_KP_ENTER => {
+            let attempt = matches!(
+                &app.screen,
+                KioskScreen::Configure { scanning: true, scan } if !scan.is_empty()
+            );
             if let Some(config) = app.enter() {
+                if attempt {
+                    sound::play(&sound::scan_cues(true));
+                }
                 store_config(app, config);
+            } else if attempt {
+                sound::play(&sound::scan_cues(false));
             }
         }
         XK_BACKSPACE => app.backspace(),
         XK_ESCAPE => {
-            if matches!(app.screen, KioskScreen::Configure { scanning: true, .. }) {
+            if app.power_menu() {
+                app.close_power_menu();
+            } else if matches!(app.screen, KioskScreen::Configure { scanning: true, .. }) {
                 app.cancel_scan();
             }
         }
@@ -235,26 +483,45 @@ fn on_key(app: &mut App, keysym: u32) {
     }
 }
 
-fn launch_chrome(url: &str) -> Result<(), String> {
+fn run_power_action(action: PowerAction) -> Result<(), String> {
+    let command = match action {
+        PowerAction::PowerOff => "poweroff",
+        PowerAction::Restart => "reboot",
+    };
+    Command::new("systemctl")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Could not {command} the kiosk: {err}"))
+}
+
+fn launch_chrome(url: &str) -> Result<Child, String> {
     let program = ["chromium-browser", "chromium", "google-chrome", "google-chrome-stable"]
         .into_iter()
         .find(|name| command_exists(name))
         .ok_or_else(|| "Chrome is not installed.".to_string())?;
-    let mut command = Command::new(program);
-    command.args([
-        "--kiosk",
-        "--no-first-run",
-        "--disable-infobars",
-        "--disable-translate",
-        "--disable-session-crashed-bubble",
-        "--overscroll-history-navigation=0",
-        "--check-for-update-interval=31536000",
-        "--no-sandbox",
-        "--user-data-dir=/var/lib/ctk/chrome",
-        url,
-    ]);
-    let error = std::os::unix::process::CommandExt::exec(&mut command);
-    Err(format!("Chrome did not start: {error}"))
+    // Stay alive so the logo can cover Chrome and the panel can still sleep.
+    Command::new(program)
+        .args([
+            "--kiosk",
+            "--no-first-run",
+            "--disable-infobars",
+            "--disable-translate",
+            "--disable-session-crashed-bubble",
+            "--overscroll-history-navigation=0",
+            "--check-for-update-interval=31536000",
+            "--no-sandbox",
+            "--user-data-dir=/var/lib/ctk/chrome",
+            url,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("Chrome did not start: {err}"))
 }
 
 fn command_exists(name: &str) -> bool {
@@ -270,6 +537,20 @@ struct Keys {
 }
 
 impl Keys {
+    fn keycodes_for(&self, symbols: &[u32]) -> Vec<u8> {
+        let per = usize::from(self.per.max(1));
+        let mut codes = Vec::new();
+        for (offset, row) in self.syms.chunks(per).enumerate() {
+            if row.iter().any(|sym| *sym != 0 && symbols.contains(sym)) {
+                let code = u16::from(self.min) + offset as u16;
+                if code <= u16::from(u8::MAX) {
+                    codes.push(code as u8);
+                }
+            }
+        }
+        codes
+    }
+
     fn keysym(&self, keycode: u8, state: u16) -> u32 {
         let shifted = state & XK_SHIFT != 0;
         let level = if shifted && self.per > 1 { 1 } else { 0 };
@@ -309,6 +590,8 @@ impl Rect {
 struct Hits {
     scale: i32,
     action: Rect,
+    power_off: Rect,
+    restart: Rect,
 }
 
 fn layout(width: u32, height: u32) -> Hits {
@@ -318,12 +601,27 @@ fn layout(width: u32, height: u32) -> Hits {
     let margin = scale * 6;
     let line = scale * 10;
     let button_h = line + scale * 8;
+    let menu_w = (width - margin * 2).min(scale * 36);
+    let menu_x = (width - menu_w) / 2;
+    let menu_y = (height - (line * 6 + button_h * 2 + scale * 3)) / 2;
     Hits {
         scale,
         action: Rect {
             x: margin,
             y: height - margin - button_h,
             w: width - margin * 2,
+            h: button_h,
+        },
+        power_off: Rect {
+            x: menu_x + scale * 2,
+            y: menu_y + line * 3,
+            w: menu_w - scale * 4,
+            h: button_h,
+        },
+        restart: Rect {
+            x: menu_x + scale * 2,
+            y: menu_y + line * 3 + button_h + scale * 2,
+            w: menu_w - scale * 4,
             h: button_h,
         },
     }
@@ -436,6 +734,40 @@ fn paint(frame: &mut Frame, background: &[u8], app: &App, color: &impl Fn(u8, u8
             button_label(frame, hits.action, scale, label, button, text);
         }
     }
+    if app.power_menu() {
+        draw_power_menu(frame, hits, text, button, danger, shadow);
+    }
+}
+
+fn draw_power_menu(
+    frame: &mut Frame,
+    hits: Hits,
+    text: Color,
+    button: Color,
+    danger: Color,
+    shadow: Color,
+) {
+    frame.darken(3, 5);
+    let pad = hits.scale * 2;
+    let panel = Rect {
+        x: hits.power_off.x - pad,
+        y: hits.power_off.y - hits.scale * 3,
+        w: hits.power_off.w + pad * 2,
+        h: hits.restart.y + hits.restart.h - hits.power_off.y + hits.scale * 3 + pad,
+    };
+    frame.rect(panel, shadow);
+    let title_width = "Power options".chars().count() as i32 * hits.scale * 8;
+    draw_content(
+        frame,
+        panel.x + (panel.w - title_width) / 2,
+        panel.y + hits.scale,
+        hits.scale,
+        "Power options",
+        text,
+        shadow,
+    );
+    button_label(frame, hits.power_off, hits.scale, "Power off", danger, text);
+    button_label(frame, hits.restart, hits.scale, "Restart", button, text);
 }
 
 fn draw_content(
@@ -521,6 +853,8 @@ fn present(
         let rows = max_rows.min(frame.height as usize - y);
         let start = y * row_bytes;
         let end = (y + rows) * row_bytes;
+        // A full-screen frame spans many X11 requests. Queue them all and
+        // flush once instead of synchronously waiting for every chunk.
         conn.put_image(
             ImageFormat::Z_PIXMAP,
             window,
@@ -533,8 +867,6 @@ fn present(
             depth,
             &frame.data[start..end],
         )
-        .map_err(|err| err.to_string())?
-        .check()
         .map_err(|err| err.to_string())?;
         y += rows;
     }
@@ -556,6 +888,30 @@ impl Frame {
         }
     }
 
+    fn copy_rgb(
+        &mut self,
+        rgb: &[u8],
+        src_w: u32,
+        src_h: u32,
+        color: &impl Fn(u8, u8, u8) -> Color,
+    ) {
+        if src_w == 0 || src_h == 0 || self.width == 0 || self.height == 0 {
+            return;
+        }
+        for y in 0..self.height {
+            let sy = (u64::from(y) * u64::from(src_h) / u64::from(self.height)) as u32;
+            let row = sy.min(src_h - 1) as usize * src_w as usize * 3;
+            for x in 0..self.width {
+                let sx = (u64::from(x) * u64::from(src_w) / u64::from(self.width)) as u32;
+                let index = row + sx.min(src_w - 1) as usize * 3;
+                let Some(pixel) = rgb.get(index..index + 3) else {
+                    return;
+                };
+                self.set_pixel(x as i32, y as i32, color(pixel[0], pixel[1], pixel[2]));
+            }
+        }
+    }
+
     fn fill(&mut self, color: Color) {
         self.rect(
             Rect {
@@ -566,6 +922,18 @@ impl Frame {
             },
             color,
         );
+    }
+
+    fn darken(&mut self, numerator: u8, denominator: u8) {
+        if denominator == 0 || self.bytes_per_pixel < 3 {
+            return;
+        }
+        for pixel in self.data.chunks_exact_mut(self.bytes_per_pixel) {
+            for channel in pixel.iter_mut().take(3) {
+                *channel = (u16::from(*channel) * u16::from(numerator)
+                    / u16::from(denominator)) as u8;
+            }
+        }
     }
 
     fn rect(&mut self, rect: Rect, color: Color) {

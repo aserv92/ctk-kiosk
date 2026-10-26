@@ -1,5 +1,7 @@
 mod disks;
 mod install;
+#[path = "../../kiosk-launcher/screensaver.rs"]
+mod screensaver;
 mod ui;
 
 use std::process::Command;
